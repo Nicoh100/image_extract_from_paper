@@ -200,15 +200,26 @@ def page_caption_lines(page: fitz.Page) -> List[Tuple[str, List[float]]]:
     return out
 
 
-def refine_caption_rect(page: fitz.Page, cap_rect: Sequence[float], cap_text: Optional[str]) -> List[float]:
-    """Return a very tight rectangle around just the 'Fig N …' line (± one wrapped line).
+def refine_caption_rect(
+    page: fitz.Page,
+    cap_rect: Sequence[float],
+    cap_text: Optional[str],
+    max_caption_height_mm: float = 36.0,
+    max_caption_lines: int = 0,
+) -> List[float]:
+    """Return a tight rectangle around the full caption under the figure label.
 
-    This ignores block-level boxes and derives the bottom from the exact line glyphs.
+    Robust baseline-based grouping that generalizes to 1..N lines:
+    - Start at the line containing the figure label (e.g., "Fig 1").
+    - Append following baselines while size/gap remain caption-like and within height/line limits.
+    - Stop when encountering heading-like text or a clear style jump.
     """
     rd = page.get_text("rawdict")
     lines: List[Tuple[float, float, str, List[float], float]] = []  # (y0, x0, text, rect, size)
-    # Only consider lines that intersect the original caption rect
-    capR = fitz.Rect(float(cap_rect[0]), float(cap_rect[1]), float(cap_rect[2]), float(cap_rect[3]))
+    # Consider lines in a vertical band from slightly above the first-line top
+    # down to well below the original caption bottom so wrapped lines are captured
+    y_top_limit = float(cap_rect[1]) - mm_to_points(6)
+    y_bottom_limit = float(cap_rect[3]) + mm_to_points(60)
     for block in rd.get("blocks", []):
         for line in block.get("lines", []):
             spans = line.get("spans", [])
@@ -218,8 +229,7 @@ def refine_caption_rect(page: fitz.Page, cap_rect: Sequence[float], cap_text: Op
             by0 = min(float(s.get("bbox", [0, 0, 0, 0])[1]) for s in spans)
             bx1 = max(float(s.get("bbox", [0, 0, 0, 0])[2]) for s in spans)
             by1 = max(float(s.get("bbox", [0, 0, 0, 0])[3]) for s in spans)
-            rect = fitz.Rect(bx0, by0, bx1, by1)
-            if not rect.intersects(capR):
+            if by0 < y_top_limit or by0 > y_bottom_limit:
                 continue
             text = "".join(s.get("text", "") for s in spans).strip()
             sizes = [float(s.get("size", 0.0)) for s in spans if float(s.get("size", 0.0)) > 0]
@@ -244,19 +254,52 @@ def refine_caption_rect(page: fitz.Page, cap_rect: Sequence[float], cap_text: Op
 
     used = [lines[start_idx]]
     base_size = used[0][4]
-    base_left = used[0][1]
+    base_height = max(1.0, used[0][3][3] - used[0][3][1])
     prev_bottom = used[0][3][3]
-    # Consider at most one wrap line if alignment and size match
-    if start_idx + 1 < len(lines):
-        _, _, t2, r2, sz2 = lines[start_idx + 1]
-        head = (t2.split()[0].lower() if t2 else "")
-        cond_head = head not in {"results", "methods", "introduction", "discussion", "conclusion", "acknowledgments"}
-        cond_align = abs(r2[0] - base_left) <= mm_to_points(3)
-        cond_size = sz2 <= base_size + 0.4
-        cond_gap = (r2[1] - prev_bottom) <= (r2[3] - r2[1]) * 0.4
-        if cond_head and cond_align and cond_size and cond_gap:
-            used.append(lines[start_idx + 1])
-            prev_bottom = r2[3]
+    start_top = used[0][3][1]
+
+    stop_words = {"results", "methods", "introduction", "discussion", "conclusion", "acknowledgments", "references"}
+    max_h_pts = mm_to_points(max_caption_height_mm)
+
+    # Iterate over following baselines, adding while rules hold
+    for idx in range(start_idx + 1, len(lines)):
+        _, _, t2, r2, sz2 = lines[idx]
+        if not t2:
+            break
+        first_token = (t2.split()[0].lower() if t2.split() else "")
+        # Stop at obvious section headings
+        if first_token in stop_words:
+            break
+        # Stop on big font jump (likely heading)
+        if sz2 >= base_size + 1.8:
+            break
+        # Excessive vertical gap relative to caption line height -> new block
+        line_h = max(1.0, r2[3] - r2[1])
+        if (r2[1] - prev_bottom) > 2.0 * max(base_height, line_h):
+            break
+        # Height/line limits
+        if (r2[3] - start_top) > max_h_pts:
+            break
+        if max_caption_lines > 0 and len(used) >= max_caption_lines:
+            break
+        used.append(lines[idx])
+        prev_bottom = r2[3]
+
+    # Guarantee a second line when present immediately below the first (typical two-line captions)
+    if len(used) == 1:
+        window_pts = mm_to_points(40.0)
+        for idx in range(start_idx + 1, len(lines)):
+            _, _, t2, r2, sz2 = lines[idx]
+            if not t2:
+                continue
+            first_token = (t2.split()[0].lower() if t2.split() else "")
+            if first_token in stop_words:
+                break
+            # within vertical window below the first line
+            if (r2[1] - used[0][3][1]) <= window_pts and (r2[1] - prev_bottom) <= window_pts:
+                if (r2[3] - start_top) <= max_h_pts:
+                    used.append(lines[idx])
+                break
 
     bx0 = min(u[3][0] for u in used)
     by0 = min(u[3][1] for u in used)
